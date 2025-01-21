@@ -1,0 +1,181 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"os"
+	"os/signal"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
+)
+
+// Payment represents the structure of our payment message.
+type Payment struct {
+	Id int `json:"id"`
+}
+
+func main() {
+	// Configuration
+	bootstrapServers := getEnv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+	topic := getEnv("KAFKA_TOPIC", "payments")
+	groupID := getEnv("KAFKA_GROUP_ID", "payment-producer")
+
+	// Create Kafka producer
+	producer, err := kafka.NewProducer(&kafka.ConfigMap{
+		"bootstrap.servers": bootstrapServers,
+		"client.id":         groupID,
+		"acks":              "all", // Ensure all brokers acknowledge
+	})
+	if err != nil {
+		log.Fatalf("Failed to create Kafka producer: %v", err)
+	}
+	defer producer.Close()
+
+	// Delivery report handler for produced messages
+	go func() {
+		for e := range producer.Events() {
+			switch ev := e.(type) {
+			case *kafka.Message:
+				if ev.TopicPartition.Error != nil {
+					log.Printf("Delivery failed: %v\n", ev.TopicPartition)
+				} else {
+					log.Printf("Delivered message to %v\n", ev.TopicPartition)
+				}
+			}
+		}
+	}()
+
+	// Create a channel to listen for OS signals for graceful shutdown
+	sigchan := make(chan os.Signal, 1)
+	signal.Notify(sigchan, syscall.SIGINT, syscall.SIGTERM)
+
+	// Counter for generating payment IDs
+	var paymentId int32 = 0
+
+	// Ticker for 30-second interval
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	log.Println("Starting payment producer...")
+
+	// Main loop
+	run := true
+	for run {
+		select {
+		case <-ticker.C:
+			// Generate payment ID
+			id := atomic.AddInt32(&paymentId, 1)
+
+			// Create payment message
+			payment := Payment{Id: int(id)}
+
+			// Serialize payment to JSON
+			paymentJSON, err := json.Marshal(payment)
+			if err != nil {
+				log.Printf("Failed to serialize payment: %v", err)
+				continue
+			}
+
+			// Produce message to Kafka
+			err = producer.Produce(&kafka.Message{
+				TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: kafka.PartitionAny},
+				Value:          paymentJSON,
+			}, nil)
+
+			if err != nil {
+				log.Printf("Failed to produce message: %v", err)
+			} else {
+				log.Printf("Produced payment message: %s", paymentJSON)
+			}
+
+			// Flush messages to ensure they are sent to Kafka
+			producer.Flush(15 * 1000) // Wait up to 15 seconds for messages to be delivered
+
+		case sig := <-sigchan:
+			log.Printf("Caught signal %v: terminating\n", sig)
+			run = false
+		}
+	}
+
+	log.Println("Payment producer stopped.")
+}
+
+// getEnv retrieves an environment variable value or a default value.
+func getEnv(key, fallback string) string {
+	if value, ok := os.LookupEnv(key); ok {
+		return value
+	}
+	return fallback
+}
+
+Explanation:
+ * Dependencies:
+   * encoding/json: For serializing the Payment struct to JSON.
+   * log: For logging messages.
+   * os: For accessing environment variables and handling signals.
+   * os/signal: For catching OS signals like SIGINT and SIGTERM.
+   * sync/atomic: For atomically incrementing the payment ID.
+   * syscall: For signal constants.
+   * time: For the ticker to control the 30-second interval.
+   * github.com/confluentinc/confluent-kafka-go/v2/kafka: The Confluent Kafka client library for Go.
+ * Configuration:
+   * bootstrapServers: Kafka broker addresses (default: localhost:9092).
+   * topic: The Kafka topic to produce messages to (default: payments).
+   * groupID: A client ID to identify the producer (default: payment-producer)
+ * Payment Struct:
+   * Payment: Defines the structure of the message with an Id field.
+ * Kafka Producer Creation:
+   * kafka.NewProducer(): Creates a new Kafka producer instance with the specified configuration.
+   * "acks": "all": This setting ensures that the producer receives acknowledgements from all brokers in the cluster that they have successfully received the message. This guarantees durability but can impact performance. You may adjust this setting depending on your reliability requirements.
+ * Delivery Report Handler:
+   * The goroutine listens to the producer.Events() channel for delivery reports of produced messages.
+ * Signal Handling:
+   * sigchan: A channel to receive OS signals.
+   * signal.Notify(): Registers sigchan to receive SIGINT (Ctrl+C) and SIGTERM signals.
+ * Payment ID Counter:
+   * paymentId: An int32 variable to store the payment ID, initialized to 0.
+   * atomic.AddInt32(): Atomically increments paymentId to ensure unique IDs in a concurrent environment.
+ * Ticker:
+   * time.NewTicker(30 * time.Second): Creates a ticker that sends a signal every 30 seconds.
+ * Main Loop:
+   * run: A boolean variable controlling the main loop.
+   * select: Allows the program to wait on multiple channel operations.
+   * case <-ticker.C: This case executes every 30 seconds when the ticker sends a signal.
+     * Generates a new payment ID.
+     * Creates a Payment struct.
+     * Marshals the Payment struct to JSON.
+     * Produces the message to Kafka using producer.Produce().
+     * Prints a log message indicating successful production.
+     * producer.Flush(15 * 1000): This is crucial for ensuring that the messages are actually sent to Kafka. It waits up to 15 seconds for all outstanding messages to be delivered. Without this, messages might be buffered in the producer and not sent immediately, leading to potential data loss if the application terminates prematurely.
+   * case sig := <-sigchan: This case executes when an OS signal is received.
+     * Logs the received signal.
+     * Sets run to false to terminate the loop gracefully.
+ * Environment Variable Helper:
+   * getEnv(): A helper function to get environment variable values with a default fallback.
+How to Run:
+ * Install Dependencies:
+   go get github.com/confluentinc/confluent-kafka-go/v2/kafka
+
+ * Compile:
+   go build -o payment-producer
+
+ * Run (Assuming Kafka is running locally on port 9092):
+   ./payment-producer
+
+   Or, with custom environment variables:
+   KAFKA_BOOTSTRAP_SERVERS="your_kafka_broker:9092" KAFKA_TOPIC="your_topic" ./payment-producer
+
+Important Considerations:
+ * Error Handling: The code includes basic error handling, but you should add more robust error handling and potentially retry mechanisms for production environments.
+ * Kafka Setup: Make sure you have a running Kafka instance and the topic "payments" (or the one you configure) is created.
+ * Producer Acknowledgements (acks):  The current setting of acks: "all" ensures the highest level of durability, but it can impact performance. Consider using acks: "1" or acks: "0" if you need higher throughput and can tolerate some potential message loss in exceptional circumstances.
+ * Security: If your Kafka cluster is secured, you'll need to add appropriate security configurations (e.g., SASL, SSL) to the kafka.ConfigMap.
+ * Monitoring: In a real-world application, add proper monitoring and alerting to track the producer's health, message delivery rates, and potential errors.
+ * Flush Frequency:  The producer.Flush() is called after each message production.  While this ensures immediate delivery, it might impact performance. For higher throughput, consider flushing less frequently, like after a batch of messages, but be mindful of the potential for message loss if the application exits before flushing.
+ * ID Generation:  Using a simple counter is fine for demonstration purposes, but in a distributed production environment, you should use a more robust ID generation strategy like UUIDs or a distributed ID generator to guarantee uniqueness across multiple producer instances.
+ * confluent-kafka-go version Make sure to use the latest version of the confluent-kafka-go library as it provides the most up to date feature and bug fixes. Use go get -u github.com/confluentinc/confluent-kafka-go/v2/kafka to update.
+This comprehensive guide helps you get started with building a reliable Kafka producer in Go!
